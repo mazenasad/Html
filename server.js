@@ -3,93 +3,116 @@ const multer = require('multer');
 const zip = require('adm-zip');
 const fs = require('fs-extra');
 const path = require('path');
+const crypto = require('crypto');
+const async = require('async');
 
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 
 const TEMP_DIR = path.join(__dirname, 'public/sites');
+const MAX_SITES = 50;
 fs.ensureDirSync(TEMP_DIR);
 
-app.use(express.static('public'));
-app.use('/view', express.static(TEMP_DIR));
+// طابور معالجة ذكي لحماية الـ CPU
+const queue = async.queue(async (task) => await task(), 1);
 
-app.get('/', (req, res) => {
+app.use(express.static('public'));
+app.use(express.json());
+
+// عرض الموقع المرفوع
+app.use('/v', (req, res) => {
+    const siteId = req.path.split('/')[1];
+    const filePath = path.join(TEMP_DIR, siteId, 'index.html');
+    if (fs.existsSync(filePath)) res.sendFile(filePath);
+    else res.status(404).send("<h1>الموقع غير موجود</h1>");
+});
+
+// واجهة التحكم (Dashboard)
+app.get('/dashboard/:id/:token', async (req, res) => {
+    const { id, token } = req.params;
+    const sitePath = path.join(TEMP_DIR, id);
+    if (!fs.existsSync(sitePath)) return res.send("انتهت صلاحية الموقع");
+
     res.send(`
-        <!DOCTYPE html>
-        <html lang="ar" dir="rtl">
-        <head>
-            <meta charset="UTF-8">
-            <title>مازن هوسط | المطور الذكي</title>
-            <style>
-                body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: white; text-align: center; padding: 20px; }
-                .container { background: #1e293b; max-width: 600px; margin: 50px auto; padding: 40px; border-radius: 20px; border: 1px solid #334155; }
-                h1 { color: #38bdf8; }
-                .upload-box { border: 2px dashed #38bdf8; padding: 30px; border-radius: 15px; margin-top: 20px; }
-                button { background: #38bdf8; color: #0f172a; border: none; padding: 15px 30px; font-weight: bold; border-radius: 10px; cursor: pointer; margin-top: 20px; }
-                .info { color: #94a3b8; font-size: 0.9em; margin-top: 15px; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>🚀 مازن هوسط Pro</h1>
-                <p>ارفع (ZIP, HTML, JS, JSON, PY) وشغلها فوراً</p>
-                <div class="upload-box">
-                    <form action="/upload" method="post" enctype="multipart/form-data">
-                        <input type="file" name="file" required><br>
-                        <button type="submit">رفع وتشغيل الرابط</button>
-                    </form>
-                </div>
-                <p class="info">الرابط شغال 10 دقائق (يتجدد عند الدخول عليه)</p>
+        <body style="background:#020617; color:white; font-family:sans-serif; text-align:center; padding:50px;">
+            <h1>🛠️ لوحة تحكم موقعك</h1>
+            <p>ID: ${id}</p>
+            <div style="border:1px solid #38bdf8; padding:20px; border-radius:15px; display:inline-block;">
+                <button onclick="deleteSite()" style="background:#ef4444; color:white; border:none; padding:10px 20px; cursor:pointer; border-radius:5px;">🗑️ مسح الموقع</button>
+                <hr style="border:0.5px solid #334155; margin:20px 0;">
+                <h3>تحديث الموقع (رفع ملفات جديدة)</h3>
+                <form action="/update/${id}/${token}" method="post" enctype="multipart/form-data">
+                    <input type="file" name="files" multiple required><br><br>
+                    <button style="background:#38bdf8; color:black; border:none; padding:10px 20px; cursor:pointer; border-radius:5px;">🔄 تحديث الآن</button>
+                </form>
             </div>
+            <script>
+                async function deleteSite() {
+                    if(confirm('هل أنت متأكد؟')) {
+                        const res = await fetch('/delete/${id}/${token}', {method:'DELETE'});
+                        if(res.ok) { alert('تم المسح'); window.location.href='/'; }
+                    }
+                }
+            </script>
         </body>
-        </html>
     `);
 });
 
-app.post('/upload', upload.single('file'), async (req, res) => {
-    if (!req.file) return res.send("لم يتم اختيار ملف!");
+// مسار الرفع الأول وتوليد الـ Token
+app.post('/upload', upload.array('files', 10), async (req, res) => {
+    const sites = await fs.readdir(TEMP_DIR);
+    if (sites.length >= MAX_SITES) return res.send("السيرفر ممتلئ");
 
-    const siteId = Math.random().toString(36).substring(7);
-    const sitePath = path.join(TEMP_DIR, siteId);
-    await fs.ensureDir(sitePath);
-
-    try {
-        const ext = path.extname(req.file.originalname).toLowerCase();
-        let fileName = 'index.html';
-
-        if (ext === '.zip') {
-            const zipFile = new zip(req.file.path);
-            zipFile.extractAllTo(sitePath, true);
-        } else {
-            // لو رفع ملف بايثون أو جيسون أو غيره، هيعرضه كملف نصي أو يشغله لو ويب
-            fileName = (ext === '.html' || ext === '.htm') ? 'index.html' : req.file.originalname;
-            await fs.move(req.file.path, path.join(sitePath, fileName));
+    const id = crypto.randomBytes(10).toString('hex');
+    const token = crypto.randomBytes(16).toString('hex');
+    const sitePath = path.join(TEMP_DIR, id);
+    
+    queue.push(async () => {
+        await fs.ensureDir(sitePath);
+        for (const file of req.files) {
+            if (path.extname(file.originalname) === '.zip') new zip(file.path).extractAllTo(sitePath, true);
+            else await fs.move(file.path, path.join(sitePath, file.originalname));
+            await fs.remove(file.path);
         }
-
-        await fs.remove(req.file.path);
-
-        const fullUrl = `${req.get('host')}/view/${siteId}/${fileName}`;
-        
-        res.send(`
-            <body style="background: #0f172a; color: white; text-align: center; padding: 50px; font-family: sans-serif;">
-                <h2 style="color: #22c55e;">✅ تم الرفع بنجاح!</h2>
-                <p>رابط الملف الخاص بك:</p>
-                <a href="https://${fullUrl}" style="color: #38bdf8; font-size: 1.2em;">${fullUrl}</a>
-                <p style="color: #94a3b8;">سيتم الحذف بعد 10 دقائق من الخمول</p>
-                <button onclick="window.location.href='/'">رفع ملف آخر</button>
-            </body>
-        `);
-
-        // نظام الحذف الذكي
-        const deleteFiles = () => {
-            fs.remove(sitePath).catch(err => console.log("Error deleting:", err));
-        };
-        let timer = setTimeout(deleteFiles, 10 * 60 * 1000);
-
-    } catch (err) {
-        res.send("خطأ في معالجة الملف: " + err.message);
-    }
+        // حفظ التوكن في ملف مخفي داخل فولدر الموقع
+        await fs.writeFile(path.join(sitePath, '.token'), token);
+    }, () => {
+        const url = `https://${req.get('host')}/v/${id}`;
+        const dash = `https://${req.get('host')}/dashboard/${id}/${token}`;
+        res.send(`<h2>✅ نجح الرفع</h2><p>رابط الموقع: <a href="${url}">${url}</a></p><p>رابط التحكم (لا تشاركه!): <a href="${dash}">${dash}</a></p>`);
+    });
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`سيرفر مازن جاهز على بورت ${PORT}`));
+// مسار التحديث
+app.post('/update/:id/:token', upload.array('files', 10), async (req, res) => {
+    const { id, token } = req.params;
+    const sitePath = path.join(TEMP_DIR, id);
+    const savedToken = await fs.readFile(path.join(sitePath, '.token'), 'utf8');
+
+    if (token !== savedToken) return res.status(403).send("خطأ في المفتاح!");
+
+    queue.push(async () => {
+        // مسح القديم ووضع الجديد للتحديث اللحظي
+        const files = await fs.readdir(sitePath);
+        for (const f of files) if(f !== '.token') await fs.remove(path.join(sitePath, f));
+        
+        for (const file of req.files) {
+            if (path.extname(file.originalname) === '.zip') new zip(file.path).extractAllTo(sitePath, true);
+            else await fs.move(file.path, path.join(sitePath, file.originalname));
+            await fs.remove(file.path);
+        }
+    }, () => res.redirect(`/dashboard/${id}/${token}`));
+});
+
+// مسار المسح
+app.delete('/delete/:id/:token', async (req, res) => {
+    const { id, token } = req.params;
+    const sitePath = path.join(TEMP_DIR, id);
+    const savedToken = await fs.readFile(path.join(sitePath, '.token'), 'utf8');
+    if (token === savedToken) {
+        await fs.remove(sitePath);
+        res.sendStatus(200);
+    } else res.sendStatus(403);
+});
+
+app.listen(process.env.PORT || 10000);
